@@ -3,8 +3,8 @@ package main
 
 import (
 	"database/sql"
+	json "encoding/json"
 	"fmt"
-	"github.com/goccy/go-json"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -83,7 +83,7 @@ func init() {
 }
 
 func NewUserService(db *sql.DB) *UserService {
-	listStmt, err := db.Prepare("SELECT id, username, email, bio, created FROM users ORDER BY created DESC")
+	listStmt, err := db.Prepare("SELECT id, username, email, bio, created FROM users ORDER BY created DESC LIMIT 20")
 	if err != nil {
 		log.Fatal("Failed to prepare statement:", err)
 	}
@@ -204,18 +204,14 @@ func (us *UserService) ListUsers(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
-	defer func() {
-		err = rows.Close()
-		if err != nil {
+	defer rows.Close()
 
-		}
-	}()
+	users := make([]User, 0, 20)
 
-	var users []User
 	for rows.Next() {
 		var user User
 		var created time.Time
-		err := rows.Scan(&user.ID, &user.Username, &user.Email, &created)
+		err := rows.Scan(&user.ID, &user.Username, &user.Bio, &user.Email, &created)
 		if err != nil {
 			httpRequests.WithLabelValues("/users", "GET", "500").Inc()
 			http.Error(w, "Database error", http.StatusInternalServerError)
@@ -226,15 +222,19 @@ func (us *UserService) ListUsers(w http.ResponseWriter, r *http.Request) {
 		users = append(users, *processedUser)
 	}
 
-	for _, user := range users {
-		us.mutex.Lock()
-		us.cache[user.ID] = &user
-		us.mutex.Unlock()
-	}
-	cacheSize.Set(float64(len(us.cache)))
+	us.updateCache(users)
 
 	httpRequests.WithLabelValues("/users", "GET", "200").Inc()
 	us.respondWithJSON(w, http.StatusOK, users)
+}
+
+func (us *UserService) updateCache(users []User) {
+	us.mutex.Lock()
+	for _, user := range users {
+		us.cache[user.ID] = &user
+	}
+	us.mutex.Unlock()
+	cacheSize.Set(float64(len(us.cache)))
 }
 
 func (us *UserService) UpdateUser(w http.ResponseWriter, r *http.Request) {
@@ -365,10 +365,10 @@ func (us *UserService) validateUser(user *User) bool {
 }
 
 func (us *UserService) processUserData(user *User) *User {
-	processedUser := *user
-	processedUser.Bio = strings.Join(strings.Fields(processedUser.Bio), " ")
-
-	return &processedUser
+	if strings.Contains(user.Bio, "  ") {
+		user.Bio = strings.ReplaceAll(user.Bio, "  ", " ")
+	}
+	return user
 }
 
 func (us *UserService) respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
@@ -377,6 +377,7 @@ func (us *UserService) respondWithJSON(w http.ResponseWriter, code int, payload 
 
 	// Stream directly to response instead of marshaling to memory first
 	encoder := json.NewEncoder(w)
+	encoder.SetEscapeHTML(false)
 	if err := encoder.Encode(payload); err != nil {
 		http.Error(w, "JSON encoding error", http.StatusInternalServerError)
 		return
