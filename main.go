@@ -3,8 +3,8 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
+	"github.com/goccy/go-json"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
@@ -30,9 +30,10 @@ type User struct {
 }
 
 type UserService struct {
-	db    *sql.DB
-	cache map[int]*User
-	mutex sync.RWMutex
+	db       *sql.DB
+	cache    map[int]*User
+	mutex    sync.RWMutex
+	listStmt *sql.Stmt
 }
 
 var (
@@ -82,9 +83,15 @@ func init() {
 }
 
 func NewUserService(db *sql.DB) *UserService {
+	listStmt, err := db.Prepare("SELECT id, username, email, bio, created FROM users ORDER BY created DESC")
+	if err != nil {
+		log.Fatal("Failed to prepare statement:", err)
+	}
+
 	return &UserService{
-		db:    db,
-		cache: make(map[int]*User),
+		db:       db,
+		cache:    make(map[int]*User),
+		listStmt: listStmt,
 	}
 }
 
@@ -191,8 +198,7 @@ func (us *UserService) ListUsers(w http.ResponseWriter, r *http.Request) {
 	requestCount++
 	counterMutex.Unlock()
 
-	query := "SELECT id, username, email, bio, created FROM users ORDER BY created DESC"
-	rows, err := us.db.Query(query)
+	rows, err := us.listStmt.Query()
 	if err != nil {
 		httpRequests.WithLabelValues("/users", "GET", "500").Inc()
 		http.Error(w, "Database error", http.StatusInternalServerError)
@@ -209,7 +215,7 @@ func (us *UserService) ListUsers(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var user User
 		var created time.Time
-		err := rows.Scan(&user.ID, &user.Username, &user.Email, &user.Bio, &created)
+		err := rows.Scan(&user.ID, &user.Username, &user.Email, &created)
 		if err != nil {
 			httpRequests.WithLabelValues("/users", "GET", "500").Inc()
 			http.Error(w, "Database error", http.StatusInternalServerError)
@@ -366,16 +372,13 @@ func (us *UserService) processUserData(user *User) *User {
 }
 
 func (us *UserService) respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
-	response, err := json.Marshal(payload)
-	if err != nil {
-		http.Error(w, "JSON encoding error", http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_, err = w.Write(response)
-	if err != nil {
+
+	// Stream directly to response instead of marshaling to memory first
+	encoder := json.NewEncoder(w)
+	if err := encoder.Encode(payload); err != nil {
+		http.Error(w, "JSON encoding error", http.StatusInternalServerError)
 		return
 	}
 }
@@ -417,9 +420,9 @@ func initDB() *sql.DB {
 		log.Fatal("Failed to connect to database:", err)
 	}
 
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(time.Hour)
+	db.SetMaxOpenConns(50) // Increase from 10
+	db.SetMaxIdleConns(25) // Increase from 5
+	db.SetConnMaxLifetime(30 * time.Minute)
 
 	// Create table
 	createTableSQL := `
